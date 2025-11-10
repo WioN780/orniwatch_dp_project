@@ -8,6 +8,9 @@ from torch.utils.data import DataLoader, ConcatDataset
 
 import contextlib
 
+import time
+from tqdm import tqdm
+
 from common.logging_extensions import *
 from classes.BirdDataset import BirdDataset
 from common.metrics import compute_tf_metrics, compute_time_metrics
@@ -114,56 +117,122 @@ def create_dataloaders(cfg: TrainConfig, label_to_idx: Dict[str,int]) -> Tuple[D
 
 
 # ---------- train/eval ----------
-def train_one_epoch(model, loader, optimizer, bce_time, bce_tf, device, amp_dtype, lambda_time: float, target_type: str):
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    bce_time,
+    bce_tf,
+    device,
+    amp_dtype,
+    lambda_time: float,
+    target_type: str,
+    metric_thr: float = 0.05,
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Returns:
+      train_loss_avg: float
+      train_metrics_avg: dict with keys like train_tf_f1_macro, train_time_f1_macro, ...
+    """
     model.train()
     use_amp = (device.type == "cuda") and (amp_dtype is not None)
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
     loss_sum, n_batches = 0.0, 0
-    for xb, yb in loader:
+    train_metrics_sum: Dict[str, float] = {}
+
+    bar = tqdm(loader, desc="train", leave=False)
+    for xb, yb in bar:
+        t_batch0 = time.perf_counter()
+
         xb = xb.to(device, non_blocking=True).float()
         yb = yb.to(device, non_blocking=True).float()
-
         want_tf = (target_type == "tf" and yb.dim() == 4)
 
-        optimizer.zero_grad(set_to_none=True)
+        # reset peak mem for this iteration
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+
+        # ---- forward
+        t0 = time.perf_counter()
         ctx = torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype) if use_amp else contextlib.nullcontext()
         with ctx:
             time_logits, tf_logits = model(xb, return_tf=want_tf)
+        t1 = time.perf_counter()
 
-            if want_tf:
+        # ---- loss
+        if want_tf:
+            loss_tf   = bce_tf(tf_logits, yb)                  # (B,C,F,T)
+            loss_time = bce_time(time_logits, yb.amax(dim=2))  # (B,C,T)
+            loss = loss_tf + lambda_time * loss_time
+        else:
+            loss = bce_time(time_logits, yb)
+        t2 = time.perf_counter()
 
-                if n_batches == 0:
-
-                    y_tf   = yb
-                    y_time = yb.amax(dim=2)     
-
-                    print("\n[DEBUG] tf_logits mean/std:", tf_logits.detach().float().mean().item(),
-                        tf_logits.detach().float().std().item())
-                    print("[DEBUG] y_tf mean/std:", y_tf.float().mean().item(), y_tf.float().std().item())
-                    print("[DEBUG] time_logits mean/std:", time_logits.detach().float().mean().item(),
-                        time_logits.detach().float().std().item())
-                    print("[DEBUG] y_time mean/std:", y_time.float().mean().item(), y_time.float().std().item())
-
-                # TF head
-                loss_tf = bce_tf(tf_logits, yb)          # (B,C,F,T)
-                # TIME head from TF target
-                loss_time = bce_time(time_logits, yb.amax(dim=2))  # (B,C,T)
-                loss = loss_tf + lambda_time * loss_time
-            else:
-                loss = bce_time(time_logits, yb)         # (B,C,T)
-
+        # ---- backward/step
         scaler.scale(loss).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-        scaler.step(optimizer); scaler.update()
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+        t3 = time.perf_counter()
 
-        loss_sum += float(loss.item()); n_batches += 1
+        # timings + memory
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            mem_cur  = torch.cuda.memory_allocated() / (1024**2)
+            mem_peak = torch.cuda.max_memory_allocated() / (1024**2)
+        else:
+            mem_cur = mem_peak = 0.0
 
-    return loss_sum / max(n_batches, 1)
+        # ---- quick train metrics (detach; keep it cheap)
+        with torch.no_grad():
+            if want_tf:
+                y_time = yb.amax(dim=2)
+                m_tf   = compute_tf_metrics(tf_logits.detach().float(),    yb.float(),    thr=metric_thr)
+                m_time = compute_time_metrics(time_logits.detach().float(), y_time.float(), thr=metric_thr)
+                m = {**m_tf, **m_time}
+            else:
+                m = compute_time_metrics(time_logits.detach().float(), yb.float(), thr=metric_thr)
+
+        # aggregate (vector -> scalar mean)
+        for k, v in m.items():
+            if torch.is_tensor(v):
+                v = float(v.mean().item()) if v.numel() > 1 else float(v.item())
+            else:
+                v = float(v)
+            train_metrics_sum[k] = train_metrics_sum.get(k, 0.0) + v
+
+        loss_sum += float(loss.item())
+        n_batches += 1
+
+        # tqdm bar
+        bar.set_postfix({
+            "loss": f"{loss_sum / n_batches:.4f}",
+            "fw(ms)": f"{(t1 - t0) * 1e3:.1f}",
+            "ls(ms)": f"{(t2 - t1) * 1e3:.1f}",
+            "bw+opt(ms)": f"{(t3 - t2) * 1e3:.1f}",
+            "mem(MB)": f"{mem_cur:.0f}",
+            "peak(MB)": f"{mem_peak:.0f}",
+            "iter(ms)": f"{(t3 - t_batch0) * 1e3:.1f}",
+        })
+
+    train_metrics_avg = {f"train_{k}": v / max(n_batches, 1) for k, v in train_metrics_sum.items()}
+    return loss_sum / max(n_batches, 1), train_metrics_avg
 
 
 @torch.no_grad()
-def evaluate(model, loader, bce_time, bce_tf, device, amp_dtype, target_type: str) -> Dict[str, float]:
+def evaluate(
+    model,
+    loader,
+    bce_time,
+    bce_tf,
+    device,
+    amp_dtype,
+    target_type: str,
+    metric_thr: float = 0.05,
+) -> Dict[str, float]:
     model.eval()
     use_amp = (device.type == "cuda") and (amp_dtype is not None)
 
@@ -171,7 +240,8 @@ def evaluate(model, loader, bce_time, bce_tf, device, amp_dtype, target_type: st
     agg: Dict[str, float] = {}
     have_tf = False
 
-    for xb, yb in loader:
+    bar = tqdm(loader, desc="valid", leave=False)
+    for xb, yb in bar:
         xb = xb.to(device, non_blocking=True).float()
         yb = yb.to(device, non_blocking=True).float()
         want_tf = (target_type == "tf" and yb.dim() == 4)
@@ -179,45 +249,46 @@ def evaluate(model, loader, bce_time, bce_tf, device, amp_dtype, target_type: st
         ctx = torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype) if use_amp else contextlib.nullcontext()
         with ctx:
             time_logits, tf_logits = model(xb, return_tf=want_tf)
-
             if want_tf:
                 have_tf = True
                 y_time = yb.amax(dim=2)
                 loss = bce_tf(tf_logits, yb) + 0.3 * bce_time(time_logits, y_time)
-                m_tf   = compute_tf_metrics(tf_logits, yb, thr=0.05)
-                m_time = compute_time_metrics(time_logits, y_time, thr=0.05)
+                m_tf   = compute_tf_metrics(tf_logits.float(),  yb.float(),   thr=metric_thr)
+                m_time = compute_time_metrics(time_logits.float(), y_time.float(), thr=metric_thr)
                 m = {**m_tf, **m_time}
             else:
                 loss = bce_time(time_logits, yb)
-                m = compute_time_metrics(time_logits, yb, thr=0.05)
+                m = compute_time_metrics(time_logits.float(), yb.float(), thr=metric_thr)
 
+        # aggregate (vector -> mean)
         for k, v in m.items():
             if torch.is_tensor(v):
-                if v.numel() == 1:
-                    val = float(v.item())
-                else:
-                    val = float(v.mean().item())
+                v = float(v.mean().item()) if v.numel() > 1 else float(v.item())
             else:
-                val = float(v)
-            agg[k] = agg.get(k, 0.0) + val
+                v = float(v)
+            agg[k] = agg.get(k, 0.0) + v
+
         loss_sum += float(loss.item()); n_batches += 1
 
-    out = {k: v / max(n_batches, 1) for k, v in agg.items()}
+    out = {f"val_{k}": v / max(n_batches, 1) for k, v in agg.items()}
     out["val_loss"] = loss_sum / max(n_batches, 1)
 
+    # convenience aliases (so your CSV stays simple)
     if have_tf:
-        out["val_f1"] = out.get("tf_f1_macro", float("nan"))
-        out["val_f1_macro"] = out.get("tf_f1_macro", float("nan"))
-        out["val_prec"] = out.get("tf_prec_macro", float("nan"))
-        out["val_rec"] = out.get("tf_rec_macro", float("nan"))
+        out["val_f1"]       = out.get("val_tf_f1_macro", float("nan"))
+        out["val_f1_macro"] = out.get("val_tf_f1_macro", float("nan"))
+        out["val_prec"]     = out.get("val_tf_prec_macro", float("nan"))
+        out["val_rec"]      = out.get("val_tf_rec_macro", float("nan"))
+        out["time_f1"]      = out.get("val_time_f1_macro", float("nan"))
+        out["tf_f1"]        = out.get("val_tf_f1_macro", float("nan"))
     else:
-        out["val_f1"] = out.get("time_f1_macro", float("nan"))
-        out["val_f1_macro"] = out.get("time_f1_macro", float("nan"))
-        out["val_prec"] = out.get("time_prec_macro", float("nan"))
-        out["val_rec"] = out.get("time_rec_macro", float("nan"))
+        out["val_f1"]       = out.get("val_time_f1_macro", float("nan"))
+        out["val_f1_macro"] = out.get("val_time_f1_macro", float("nan"))
+        out["val_prec"]     = out.get("val_time_prec_macro", float("nan"))
+        out["val_rec"]      = out.get("val_time_rec_macro", float("nan"))
+        out["time_f1"]      = out.get("val_time_f1_macro", float("nan"))
+        out["tf_f1"]        = float("nan")
 
-    out["time_f1"] = out.get("time_f1_macro", float("nan"))
-    out["tf_f1"]   = out.get("tf_f1_macro", float("nan"))
     return out
 
 # ---------- fit ----------
@@ -230,10 +301,15 @@ def fit(cfg: TrainConfig, label_to_idx: Dict[str,int]):
     paths = make_run_dirs(cfg.logs_base, run_name, cfg.annotations_file)
     logger = setup_logger(paths["log_file"], name=f"trainer_{run_name}")
     attach_csv_handler(logger, paths["csv_file"], header=[
-        "epoch","train_loss","val_loss","val_f1","val_f1_macro","val_prec","val_rec","time_f1","tf_f1"
+        "epoch",
+        "train_loss",
+        "val_loss",
+        "val_f1","val_f1_macro","val_prec","val_rec","time_f1","tf_f1",
+        "train_tf_f1_macro","train_tf_prec_macro","train_tf_rec_macro","train_tf_dice",
+        "train_time_f1_macro","train_time_prec_macro","train_time_rec_macro","train_time_dice",
     ])
 
-    # n_classes from labels
+    # n_classes
     cfg.n_classes = len(label_to_idx)
 
     # model
@@ -242,32 +318,32 @@ def fit(cfg: TrainConfig, label_to_idx: Dict[str,int]):
 
     # data
     train_loader, val_loader = create_dataloaders(cfg, label_to_idx)
+    logger.info(f"train samples: {len(train_loader.dataset)}, val samples: {len(val_loader.dataset)}")
 
-    print(f"[DEBUG] train samples: {len(train_loader.dataset)}, val samples: {len(val_loader.dataset)}")
-
-    # optional pos_weight
+    # pos_weight
     pos_weight = None
     if cfg.pos_weight == "auto" and compute_pos_weight is not None:
-        pos_weight, raw_ratio = compute_pos_weight(train_loader, device, limit_batches=None)
+        pos_weight, _ = compute_pos_weight(train_loader, device, limit_batches=None)
         logger.info(f"pos_weight(auto): {pos_weight}")
 
-    # loss/optim/amp
+    # losses
     if pos_weight is not None:
-        pos_weight_tf   = pos_weight.view(1, -1, 1, 1)  # for (B,C,F,T)
-        pos_weight_time = pos_weight.view(1, -1, 1)     # for (B,C,T)
+        pos_weight_tf   = pos_weight.view(1, -1, 1, 1)  # (1,C,1,1) for TF
+        pos_weight_time = pos_weight.view(1, -1, 1)     # (1,C,1)   for time
     else:
         pos_weight_tf = pos_weight_time = None
 
     bce_tf   = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tf)
     bce_time = nn.BCEWithLogitsLoss(pos_weight=pos_weight_time)
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+
+    # optim/amp
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "off": None}[cfg.amp]
 
     # save config
     cfg_dict = asdict(cfg)
     cfg_dict["paths"] = paths
     cfg_dict["model"] = model.__class__.__name__
-
     logger.info(f"config: {json.dumps(cfg_dict, indent=2, default=str)}")
 
     ckpts = CheckpointManager(paths["ckpt_dir"], mode=cfg.monitor_mode, k=cfg.save_top_k, filename_prefix=cfg.model_name.lower())
@@ -275,22 +351,81 @@ def fit(cfg: TrainConfig, label_to_idx: Dict[str,int]):
 
     for epoch in range(1, cfg.epochs+1):
         t0 = time.time()
-        train_loss = train_one_epoch(model, train_loader, optimizer, bce_time, bce_tf, device, amp_dtype, lambda_time=0.3, target_type=cfg.target_type)
-        val_metrics = evaluate(model, val_loader, bce_time, bce_tf, device, amp_dtype, cfg.target_type)
+
+        # ---- start memory history for this epoch
+        mem_hist_enabled = False
+        if torch.cuda.is_available() and hasattr(torch.cuda.memory, "_record_memory_history"):
+            try:
+                torch.cuda.memory._record_memory_history(max_entries=1_000_000)
+                mem_hist_enabled = True
+                logger.info(f"[epoch {epoch}] CUDA memory history: ENABLED")
+            except Exception as e:
+                logger.error(f"[epoch {epoch}] Failed to enable memory history: {e}")
+
+        # ---- train
+        train_loss, train_metrics = train_one_epoch(
+            model, train_loader, optimizer, bce_time, bce_tf, device, amp_dtype,
+            lambda_time=0.3, target_type=cfg.target_type, metric_thr=0.05
+        )
+        # ---- validate
+        val_metrics = evaluate(
+            model, val_loader, bce_time, bce_tf, device, amp_dtype,
+            target_type=cfg.target_type, metric_thr=0.05
+        )
+
+        # ---- dump memory snapshot and stop recording
+        if mem_hist_enabled:
+            snap_path = os.path.join(paths["logs_dir"], f"cuda_mem_snapshot_e{epoch:03d}.pickle")
+            try:
+                torch.cuda.memory._dump_snapshot(snap_path)
+                logger.info(f"[epoch {epoch}] CUDA memory snapshot saved: {snap_path}")
+            except Exception as e:
+                logger.error(f"[epoch {epoch}] Failed to capture memory snapshot {e}")
+            # stop recording for this epoch
+            try:
+                torch.cuda.memory._record_memory_history(enabled=None)
+            except Exception as e:
+                logger.error(f"[epoch {epoch}] Failed to stop memory history: {e}")
+
         elapsed = time.time() - t0
 
-        score = val_metrics.get(monitor_key, -val_metrics["val_loss"] if cfg.monitor_mode=="max" else val_metrics["val_loss"])
+        # score
+        score = val_metrics.get(
+            monitor_key,
+            -val_metrics["val_loss"] if cfg.monitor_mode == "max" else val_metrics["val_loss"]
+        )
+
+        # helper
+        def get(d, k): 
+            v = d.get(k, float("nan"))
+            try:
+                return round(float(v), 6)
+            except Exception:
+                return float("nan")
+
+        # CSV row
         row = {
             "epoch": epoch,
             "train_loss": round(train_loss, 6),
-            "val_loss": round(val_metrics.get("val_loss", float("nan")), 6),
-            "val_f1": round(val_metrics.get("val_f1", float("nan")), 6),
-            "val_f1_macro": round(val_metrics.get("val_f1_macro", float("nan")), 6),
-            "val_prec": round(val_metrics.get("val_prec", float("nan")), 6),
-            "val_rec": round(val_metrics.get("val_rec", float("nan")), 6),
-            "time_f1": round(val_metrics.get("time_f1", float("nan")), 6),
-            "tf_f1": round(val_metrics.get("tf_f1", float("nan")), 6),
+            "val_loss":   get(val_metrics, "val_loss"),
+            "val_f1":     get(val_metrics, "val_f1"),
+            "val_f1_macro": get(val_metrics, "val_f1_macro"),
+            "val_prec":   get(val_metrics, "val_prec"),
+            "val_rec":    get(val_metrics, "val_rec"),
+            "time_f1":    get(val_metrics, "time_f1"),
+            "tf_f1":      get(val_metrics, "tf_f1"),
+
+            # train
+            "train_tf_f1_macro":   get(train_metrics, "train_tf_f1_macro"),
+            "train_tf_prec_macro": get(train_metrics, "train_tf_prec_macro"),
+            "train_tf_rec_macro":  get(train_metrics, "train_tf_rec_macro"),
+            "train_tf_dice":       get(train_metrics, "train_tf_dice"),
+            "train_time_f1_macro":   get(train_metrics, "train_time_f1_macro"),
+            "train_time_prec_macro": get(train_metrics, "train_time_prec_macro"),
+            "train_time_rec_macro":  get(train_metrics, "train_time_rec_macro"),
+            "train_time_dice":       get(train_metrics, "train_time_dice"),
         }
+
         log_metrics(logger, row)
         logger.info(f"epoch {epoch:03d} | {row} | {elapsed:.1f}s")
 
@@ -301,64 +436,84 @@ def fit(cfg: TrainConfig, label_to_idx: Dict[str,int]):
     return paths
 
 
-# ---------- CLI ----------
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--location", type=str, required=True)
-    p.add_argument("--data_folder", type=str, required=True)
-    p.add_argument("--annotations_file", type=str, required=True)
-    p.add_argument("--precomputed_dirs", type=str, nargs="*", default=None,
-                   help="List of precomputed feature dirs. Train uses all; val uses the first.")
-    p.add_argument("--logs_base", type=str, default="logs_folder")
-    p.add_argument("--run_name", type=str, default=None)
+# ---------- JSON config loader ----------
+def load_train_config(json_path: str) -> Tuple[TrainConfig, Dict[str, int]]:
+    if not os.path.isfile(json_path):
+        raise FileNotFoundError(f"Config file not found: {json_path}")
 
-    p.add_argument("--model_name", type=str, default="BirdCRNN",
-                   help="Class name from classes.BirdModels (e.g., BirdCRNN)")
+    with open(json_path, "r", encoding="utf-8") as f:
+        J = json.load(f)
 
-    p.add_argument("--n_mels", type=int, default=128)
-    p.add_argument("--target_type", type=str, default="tf", choices=["tf","time"])
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--epochs", type=int, default=10)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--num_workers", type=int, default=8)
-    p.add_argument("--amp", type=str, default="bf16", choices=["bf16","fp16","off"])
-    p.add_argument("--pos_weight", type=str, default="auto", choices=["auto","none"])
-    p.add_argument("--seed", type=int, default=42)
-    return p.parse_args()
+    # Accept list or comma string for precomputed_dirs
+    pre_dirs = J.get("precomputed_dirs")
+    if isinstance(pre_dirs, str):
+        pre_dirs = [s.strip() for s in pre_dirs.split(",") if s.strip()]
+    if pre_dirs is not None and not isinstance(pre_dirs, list):
+        raise ValueError("precomputed_dirs must be a list of strings or a comma-separated string.")
 
-
-if __name__ == "__main__":
-    args = parse_args()
-
-    pre_dirs = args.precomputed_dirs
-    if isinstance(pre_dirs, list) and len(pre_dirs) == 1 and ("," in pre_dirs[0]):
-        pre_dirs = [s.strip() for s in pre_dirs[0].split(",") if s.strip()]
-
+    # Build cfg (model instance added after we know n_classes)
     cfg = TrainConfig(
-        location=args.location,
-        data_folder=args.data_folder,
-        annotations_file=args.annotations_file,
-        precomputed=True if pre_dirs else False,
-        precomputed_dirs=pre_dirs,
-        n_mels=args.n_mels,
-        target_type=args.target_type,
-        batch_size=args.batch_size,
-        epochs=args.epochs,
-        lr=args.lr,
-        num_workers=args.num_workers,
-        amp=args.amp,
-        pos_weight=("auto" if args.pos_weight=="auto" else "none"),
-        model_name=args.model_name,
-        model=instantiate_model(args.model_name, args.n_mels, args.n_classes),
-        seed=args.seed,
-        logs_base=args.logs_base,
-        run_name=args.run_name or now_ts(),
+        location          = J["location"],
+        data_folder       = J["data_folder"],
+        annotations_file  = J["annotations_file"],
+        precomputed       = J.get("precomputed", bool(pre_dirs)),
+        precomputed_dirs  = pre_dirs,
+        n_mels            = J.get("n_mels", 128),
+        window_len        = J.get("window_len", 10.0),
+        batch_size        = J.get("batch_size", 8),
+        num_workers       = J.get("num_workers", 4),
+        target_type       = J.get("target_type", "tf"),
+        include_overlaps  = J.get("include_overlaps", True),
+        lr                = J.get("lr", 1e-3),
+        epochs            = J.get("epochs", 10),
+        model_name        = J.get("model_name", "BirdCRNN"),
+        model             = BirdModels.BirdCRNN,   # temp
+        amp               = J.get("amp", "bf16"),
+        pos_weight        = J.get("pos_weight", "auto"),
+        save_top_k        = J.get("save_top_k", 3),
+        monitor           = J.get("monitor", "val_f1"),
+        monitor_mode      = J.get("monitor_mode", "max"),
+        seed              = J.get("seed", 42),
+        logs_base         = J.get("logs_base", "logs_folder"),
+        run_name          = J.get("run_name"),
     )
 
-    enc_path = os.path.join(args.data_folder, "label_encodings.json")
+    # load label encodings to get n_classes
+    enc_path = os.path.join(cfg.data_folder, "label_encodings.json")
     with open(enc_path, "r", encoding="utf-8") as f:
         encodings = json.load(f)
-    label_to_idx = {k: int(v) if isinstance(v, str) and v.isdigit() else int(v) for k, v in encodings["label_to_idx"].items()}
+    label_to_idx = {k: int(v) if isinstance(v, str) and v.isdigit() else int(v)
+                    for k, v in encodings["label_to_idx"].items()}
+    n_classes = len(label_to_idx)
+
+    #iInstantiate model with n_mels + n_classes
+    model_instance = instantiate_model(cfg.model_name, cfg.n_mels, n_classes)
+    cfg.model = model_instance
+
+    # run name gen
+    if not cfg.run_name:
+        cfg.run_name = now_ts()
+
+    return cfg, label_to_idx
+
+def parse_cli():
+    p = argparse.ArgumentParser()
+    p.add_argument(
+        "-c", "--config", "--config_path",
+        dest="config_path",
+        type=str,
+        default="train_config.json",
+        help="Path to JSON train config (overrides TRAIN_CONFIG env)."
+    )
+    return p.parse_args()
+
+# ---------- entrypoint ----------
+if __name__ == "__main__":
+    args = parse_cli()
+    config_path = args.config_path or os.environ.get("TRAIN_CONFIG") or "train_config.json"
+    print(f"[INFO] Using config: {config_path}")
+
+    cfg, label_to_idx = load_train_config(config_path)
 
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
