@@ -59,13 +59,10 @@ def _overlap_frames(s, e, win_s, win_e, sr, hop_len, T):
         return None
     return sf, ef
 
-# ---- dataset window info ---------------------------------------------------------
+# ---------- dataset window info ----------
 def ds_window_info(ds, idx: int):
     """
     Returns (filename, win_s, win_e) for a dataset item.
-    Works for:
-      - precomputed random windows (ds.use_manifest=True)
-      - on-the-fly / legacy precomputed
     """
     if getattr(ds, "precomputed", False) and getattr(ds, "use_manifest", False):
         rec = ds.manifest.loc[idx]
@@ -302,7 +299,7 @@ def _process_file_random_windows(
     filename, rows, sr, hop, n_mels, max_frames, out_dir, label_to_idx, hz_centers,
     window_len, seed
 ):
-    # load & (if needed) resample once per file
+    # load and (if needed) resample once per file
     try:
         wav, file_sr = torchaudio.load(filename)
     except Exception as e:
@@ -318,7 +315,7 @@ def _process_file_random_windows(
     db_tf = torchaudio.transforms.AmplitudeToDB()
 
     used = np.zeros(len(rows), dtype=bool)
-    rng = random.Random((seed ^ hash(os.path.basename(filename))) & 0xFFFFFFFF)
+    rng = random.Random((seed ^ hash(os.path.basename(filename))) & 0xFFFFFFFF) # fancy roll
 
     manifest_rows, logs = [], []
     base = os.path.splitext(os.path.basename(filename))[0]
@@ -588,72 +585,3 @@ def compute_pos_weight(loader, device, limit_batches=None, power=0.5, cap=(0.5, 
         w = w / w.mean().clamp_min(1e-8)
     w = w.clamp(cap[0], cap[1]).contiguous()
     return w, raw
-
-# ---------- plotting utilities (Plotly) ----------
-def _safe_import_plotly_pd():
-    try:
-        import plotly.graph_objects as go
-        return pd, go
-    except Exception:
-        return None, None
-
-def save_plotly_curves_from_csv(csv_path: str, html_path: str,
-                                y_cols: Tuple[str, ...] = ("train_loss", "val_loss", "tf_f1_micro", "time_f1_micro")) -> bool:
-    """
-    Render an HTML with selected y_cols over 'epoch' from a single CSV.
-    Returns True if written.
-    """
-    pd, go = _safe_import_plotly_pd()
-    if pd is None: return False
-    if not os.path.isfile(csv_path): return False
-
-    df = pd.read_csv(csv_path)
-    if "epoch" not in df.columns: return False
-
-    fig = go.Figure()
-    for col in y_cols:
-        if col in df.columns:
-            fig.add_trace(go.Scatter(x=df["epoch"], y=df[col], name=col, mode="lines+markers"))
-    fig.update_layout(title=os.path.basename(csv_path),
-                      xaxis_title="epoch", template="plotly_dark",
-                      width=980, height=520)
-    os.makedirs(os.path.dirname(html_path), exist_ok=True)
-    fig.write_html(html_path)
-    return True
-
-def load_runs_under(root: str) -> List[str]:
-    """
-    Find run folders recursively that contain logs/metrics.csv.
-    Returns list of metrics.csv paths.
-    """
-    found = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        if "metrics.csv" in filenames:
-            found.append(os.path.join(dirpath, "metrics.csv"))
-    return sorted(found)
-
-def compare_runs_plot(runs_csv: List[str], html_path: str, metric: str = "val_loss", label_from: str = "run"):
-    """
-    Create a comparison HTML plot for a metric across multiple runs (CSV files).
-    label_from: "run" -> parent folder name, "file" -> csv filename
-    """
-    pd, go = _safe_import_plotly_pd()
-    if pd is None: return False
-    fig = go.Figure()
-
-    for csv_path in runs_csv:
-        df = pd.read_csv(csv_path)
-        if "epoch" not in df.columns or metric not in df.columns:
-            continue
-        if label_from == "run":
-            label = os.path.basename(os.path.dirname(csv_path))  # 'logs' folder parent (run id)
-        else:
-            label = os.path.basename(csv_path)
-        fig.add_trace(go.Scatter(x=df["epoch"], y=df[metric], name=label, mode="lines+markers"))
-
-    fig.update_layout(title=f"Compare runs: {metric}",
-                      xaxis_title="epoch", yaxis_title=metric,
-                      template="plotly_dark", width=1100, height=600)
-    os.makedirs(os.path.dirname(html_path), exist_ok=True)
-    fig.write_html(html_path)
-    return True

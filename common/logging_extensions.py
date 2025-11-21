@@ -42,7 +42,7 @@ def load_config(path: str) -> dict:
 # ---------- Base Python logger (console + file) ----------
 def setup_logger(log_path: str, name: str = "trainer") -> logging.Logger:
     """
-    Console + file logger (INFO level). Idempotent per 'name'.
+    Console + file logger (INFO level)
     """
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
@@ -174,6 +174,7 @@ class CheckpointManager:
                         try:
                             os.remove(full)
                         except Exception:
+                            print("Not able to prune\n")
                             pass
             return True
         return False

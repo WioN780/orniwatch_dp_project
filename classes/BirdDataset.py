@@ -101,12 +101,6 @@ class BirdDataset(Dataset):
                     lambda sid: os.path.join(self.precomputed_dir, "samples", f"{sid}.pt")
                 )
                 self.use_manifest = True
-            else:
-                # ---- old precomputed per-row ----
-                if annotations_file is None:
-                    raise ValueError("annotations_file needed for legacy precomputed")
-                df = pd.read_csv(annotations_file).reset_index().rename(columns={"index": "row_id"})
-                self.df = df[df["where"] == split].reset_index(drop=True)
         else:
             # ---- on-the-fly from annotations ----
             if annotations_file is None:
@@ -150,7 +144,7 @@ class BirdDataset(Dataset):
     def __getitem__(self, idx):
         # --------- (A) precomputed random windows via manifest -----------
         if self.precomputed and self.use_manifest:
-            blob = torch.load(self.manifest.loc[idx, "sample_path"], map_location="cpu")
+            blob = torch.load(self.manifest.loc[idx, "sample_path"], map_location="cpu", weights_only=True)
             mel = blob["mel"]                 # (1,F,T)
             target_tf = blob["target"]        # (C,F,T)
             if self.target_type == "tf":
@@ -160,46 +154,7 @@ class BirdDataset(Dataset):
                 target_time = target_tf.amax(dim=1)   # (C,T)
                 return mel, target_time
 
-        # --------- (B) old precomputed per-row_id ---------------------
-        if self.precomputed and not self.use_manifest:
-            row = self.df.iloc[idx]
-            row_id = int(row["row_id"])
-            blob = torch.load(os.path.join(self.precomputed_dir, f"{row_id:06d}.pt"), map_location="cpu")
-            if isinstance(blob, dict) and "target" in blob:
-                mel = blob["mel"]
-                tgt = blob["target"]
-                if self.target_type == "tf":
-                    return mel, tgt
-                else:
-                    return mel, tgt.amax(dim=1)
-            else:
-                mel = (blob if torch.is_tensor(blob) else blob["mel"])
-                # no target available; build time-only from annotations
-                # fall through to on-the-fly target build
-                row_use = row
-                fname = row_use["Filename"]
-                win_s = float(row_use["Start Time (s)"]); win_e = win_s + self.window_len
-                T = mel.size(-1)
-
-                if self.include_overlaps:
-                    g = self._by_file[fname]
-                    overlaps = g[(g["Start Time (s)"] < win_e) & (g["End Time (s)"] > win_s)]
-                else:
-                    overlaps = pd.DataFrame([row_use])
-
-                target_time = torch.zeros(self.C, T, dtype=torch.float32)
-                for _, r in overlaps.iterrows():
-                    c = self.label_to_idx[r["Species eBird Code"]]
-                    s = max(float(r["Start Time (s)"]), win_s)
-                    e = min(float(r["End Time (s)"]),   win_e)
-                    if e <= s: continue
-                    sf = int(((s - win_s) * self.sr) // self.hop)
-                    ef = int(np.ceil(((e - win_s) * self.sr) / self.hop))
-                    sf = max(0, min(T, sf)); ef = max(0, min(T, ef))
-                    if ef > sf: target_time[c, sf:ef] = 1.0
-                return mel, target_time
-
-        # --------- (C) on-the-fly from annotations -----------------------
+        # --------- (B) on-the-fly from annotations -----------------------
         row = self.df.iloc[idx]
         fname = row["Filename"]
         win_s = float(row["Start Time (s)"])

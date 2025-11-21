@@ -19,19 +19,85 @@ from common.common_utils import compute_pos_weight
 
 from classes import BirdModels
 
+CSV_HEADER = [
+    "epoch",
+    "train_loss",
+    "val_loss",
+
+    # --- VAL TF ---
+    "val_tf_f1_micro",
+    "val_tf_prec_micro",
+    "val_tf_rec_micro",
+    "val_tf_f1_macro",
+    "val_tf_prec_macro",
+    "val_tf_rec_macro",
+    "val_tf_dice",
+    "val_tf_dice_soft",
+    "val_tf_bal_acc",
+    "val_tf_acc",
+    "val_tf_present_frac",
+    "val_tf_pred_pos_frac",
+    "val_tf_tgt_pos_frac",
+
+    # --- VAL TIME ---
+    "val_time_f1_micro",
+    "val_time_prec_micro",
+    "val_time_rec_micro",
+    "val_time_f1_macro",
+    "val_time_prec_macro",
+    "val_time_rec_macro",
+    "val_time_dice",
+    "val_time_dice_soft",
+    "val_time_bal_acc",
+    "val_time_acc",
+    "val_time_present_frac",
+    "val_time_pred_pos_frac",
+    "val_time_tgt_pos_frac",
+
+    # --- TRAIN TF ---
+    "train_tf_f1_micro",
+    "train_tf_prec_micro",
+    "train_tf_rec_micro",
+    "train_tf_f1_macro",
+    "train_tf_prec_macro",
+    "train_tf_rec_macro",
+    "train_tf_dice",
+    "train_tf_dice_soft",
+    "train_tf_bal_acc",
+    "train_tf_acc",
+    "train_tf_present_frac",
+    "train_tf_pred_pos_frac",
+    "train_tf_tgt_pos_frac",
+
+    # --- TRAIN TIME ---
+    "train_time_f1_micro",
+    "train_time_prec_micro",
+    "train_time_rec_micro",
+    "train_time_f1_macro",
+    "train_time_prec_macro",
+    "train_time_rec_macro",
+    "train_time_dice",
+    "train_time_dice_soft",
+    "train_time_bal_acc",
+    "train_time_acc",
+    "train_time_present_frac",
+    "train_time_pred_pos_frac",
+    "train_time_tgt_pos_frac",
+]
+
 
 # ---------- utils ----------
-def set_seed(seed: int = 42):
+def set_seed(seed: int = 123):
     random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
 
-
+# match the str from config to the actual class
 def instantiate_model(model_name: str, n_mels: int, n_classes: int) -> nn.Module:
     if not hasattr(BirdModels, model_name):
         raise ValueError(f"Model class '{model_name}' not found in classes.BirdModels")
     cls = getattr(BirdModels, model_name)
-    # Only pass n_mels and n_classes
+    # from cfg only n_mels and n_classes
     sig = cls.__init__.__code__.co_varnames
     kwargs = {}
     if "n_mels" in sig: kwargs["n_mels"] = n_mels
@@ -51,17 +117,23 @@ class TrainConfig:
     window_len: float = 10.0
     batch_size: int = 8
     num_workers: int = 4
+
     target_type: str = "tf"            # "tf" or "time"
     include_overlaps: bool = True
     lr: float = 1e-3
     epochs: int = 10
+
     model_name: str = "BirdCRNN"
     model: Type = field(default=BirdModels.BirdCRNN)
+
     amp: str = "bf16"                  # "bf16", "fp16", "off"
     pos_weight: str = "auto"           # "auto" or "none"
     save_top_k: int = 3
-    monitor: str = "val_f1"
+    
+    metric_thr: float = 0.5
+    monitor: str = "val_tf_f1_macro" # val_loss
     monitor_mode: str = "max"
+
     seed: int = 42
     logs_base: str = "logs_folder"
     run_name: Optional[str] = None
@@ -186,7 +258,7 @@ def train_one_epoch(
         else:
             mem_cur = mem_peak = 0.0
 
-        # ---- quick train metrics (detach; keep it cheap)
+        # ---- quick train metrics
         with torch.no_grad():
             if want_tf:
                 y_time = yb.amax(dim=2)
@@ -233,6 +305,7 @@ def evaluate(
     target_type: str,
     metric_thr: float = 0.05,
 ) -> Dict[str, float]:
+    
     model.eval()
     use_amp = (device.type == "cuda") and (amp_dtype is not None)
 
@@ -273,26 +346,26 @@ def evaluate(
     out = {f"val_{k}": v / max(n_batches, 1) for k, v in agg.items()}
     out["val_loss"] = loss_sum / max(n_batches, 1)
 
-    # convenience aliases (so your CSV stays simple)
-    if have_tf:
-        out["val_f1"]       = out.get("val_tf_f1_macro", float("nan"))
-        out["val_f1_macro"] = out.get("val_tf_f1_macro", float("nan"))
-        out["val_prec"]     = out.get("val_tf_prec_macro", float("nan"))
-        out["val_rec"]      = out.get("val_tf_rec_macro", float("nan"))
-        out["time_f1"]      = out.get("val_time_f1_macro", float("nan"))
-        out["tf_f1"]        = out.get("val_tf_f1_macro", float("nan"))
-    else:
-        out["val_f1"]       = out.get("val_time_f1_macro", float("nan"))
-        out["val_f1_macro"] = out.get("val_time_f1_macro", float("nan"))
-        out["val_prec"]     = out.get("val_time_prec_macro", float("nan"))
-        out["val_rec"]      = out.get("val_time_rec_macro", float("nan"))
-        out["time_f1"]      = out.get("val_time_f1_macro", float("nan"))
-        out["tf_f1"]        = float("nan")
-
     return out
 
 # ---------- fit ----------
-def fit(cfg: TrainConfig, label_to_idx: Dict[str,int]):
+def fit(cfg: TrainConfig, 
+    label_to_idx: Dict[str,int], 
+    train_loader: Optional[DataLoader] = None, 
+    val_loader: Optional[DataLoader] = None,
+    mem_save: bool = True,
+    max_iter_mem_save: int = 5
+):
+    """
+    Main training loop
+    Accepts config fully frees vram after usage. 
+    Params:
+        label_to_idx        - dict of labels to their encodings of the classificator
+        train/cal_loaders   - torch loaders
+        mem_save            - flag for creating pickled memmory snapshots. To view visit: https://docs.pytorch.org/memory_viz
+        max_iter_mem_save   - number of saved snapshots
+    """
+
     set_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -300,14 +373,8 @@ def fit(cfg: TrainConfig, label_to_idx: Dict[str,int]):
     run_name = cfg.run_name or now_ts()
     paths = make_run_dirs(cfg.logs_base, run_name, cfg.annotations_file)
     logger = setup_logger(paths["log_file"], name=f"trainer_{run_name}")
-    attach_csv_handler(logger, paths["csv_file"], header=[
-        "epoch",
-        "train_loss",
-        "val_loss",
-        "val_f1","val_f1_macro","val_prec","val_rec","time_f1","tf_f1",
-        "train_tf_f1_macro","train_tf_prec_macro","train_tf_rec_macro","train_tf_dice",
-        "train_time_f1_macro","train_time_prec_macro","train_time_rec_macro","train_time_dice",
-    ])
+    
+    attach_csv_handler(logger, paths["csv_file"], header=CSV_HEADER)
 
     # n_classes
     cfg.n_classes = len(label_to_idx)
@@ -317,7 +384,8 @@ def fit(cfg: TrainConfig, label_to_idx: Dict[str,int]):
     model.to(memory_format=torch.channels_last)
 
     # data
-    train_loader, val_loader = create_dataloaders(cfg, label_to_idx)
+    if train_loader is None or val_loader is None:
+        train_loader, val_loader = create_dataloaders(cfg, label_to_idx)
     logger.info(f"train samples: {len(train_loader.dataset)}, val samples: {len(val_loader.dataset)}")
 
     # pos_weight
@@ -347,31 +415,37 @@ def fit(cfg: TrainConfig, label_to_idx: Dict[str,int]):
     logger.info(f"config: {json.dumps(cfg_dict, indent=2, default=str)}")
 
     ckpts = CheckpointManager(paths["ckpt_dir"], mode=cfg.monitor_mode, k=cfg.save_top_k, filename_prefix=cfg.model_name.lower())
-    monitor_key = cfg.monitor if cfg.monitor in ("val_f1","time_f1","tf_f1","val_loss") else "val_f1"
+    monitor_key = cfg.monitor
 
     for epoch in range(1, cfg.epochs+1):
         t0 = time.time()
 
         # ---- start memory history for this epoch
         mem_hist_enabled = False
-        if torch.cuda.is_available() and hasattr(torch.cuda.memory, "_record_memory_history"):
+        if (
+            mem_save
+            and (max_iter_mem_save is None or epoch <= max_iter_mem_save)
+            and torch.cuda.is_available()
+            and hasattr(torch.cuda.memory, "_record_memory_history")
+        ):
             try:
                 torch.cuda.memory._record_memory_history(max_entries=1_000_000)
                 mem_hist_enabled = True
-                logger.info(f"[epoch {epoch}] CUDA memory history: ENABLED")
+                logger.info(f"[epoch {epoch}] CUDA memory history: ENABLED (epoch <= {max_iter_mem_save})")
             except Exception as e:
                 logger.error(f"[epoch {epoch}] Failed to enable memory history: {e}")
 
         # ---- train
         train_loss, train_metrics = train_one_epoch(
             model, train_loader, optimizer, bce_time, bce_tf, device, amp_dtype,
-            lambda_time=0.3, target_type=cfg.target_type, metric_thr=0.05
+            lambda_time=0.3, target_type=cfg.target_type, metric_thr=cfg.metric_thr
         )
         # ---- validate
         val_metrics = evaluate(
             model, val_loader, bce_time, bce_tf, device, amp_dtype,
-            target_type=cfg.target_type, metric_thr=0.05
+            target_type=cfg.target_type, metric_thr=cfg.metric_thr
         )
+
 
         # ---- dump memory snapshot and stop recording
         if mem_hist_enabled:
@@ -404,27 +478,18 @@ def fit(cfg: TrainConfig, label_to_idx: Dict[str,int]):
                 return float("nan")
 
         # CSV row
-        row = {
-            "epoch": epoch,
-            "train_loss": round(train_loss, 6),
-            "val_loss":   get(val_metrics, "val_loss"),
-            "val_f1":     get(val_metrics, "val_f1"),
-            "val_f1_macro": get(val_metrics, "val_f1_macro"),
-            "val_prec":   get(val_metrics, "val_prec"),
-            "val_rec":    get(val_metrics, "val_rec"),
-            "time_f1":    get(val_metrics, "time_f1"),
-            "tf_f1":      get(val_metrics, "tf_f1"),
+        row = {}
+        row["epoch"] = epoch
+        row["train_loss"] = round(train_loss, 6)
+        row["val_loss"]   = get(val_metrics, "val_loss")
 
-            # train
-            "train_tf_f1_macro":   get(train_metrics, "train_tf_f1_macro"),
-            "train_tf_prec_macro": get(train_metrics, "train_tf_prec_macro"),
-            "train_tf_rec_macro":  get(train_metrics, "train_tf_rec_macro"),
-            "train_tf_dice":       get(train_metrics, "train_tf_dice"),
-            "train_time_f1_macro":   get(train_metrics, "train_time_f1_macro"),
-            "train_time_prec_macro": get(train_metrics, "train_time_prec_macro"),
-            "train_time_rec_macro":  get(train_metrics, "train_time_rec_macro"),
-            "train_time_dice":       get(train_metrics, "train_time_dice"),
-        }
+        for k in CSV_HEADER:
+            if k in ("epoch", "train_loss", "val_loss"):
+                continue
+            if k.startswith("train_"):
+                row[k] = get(train_metrics, k)
+            elif k.startswith("val_"):
+                row[k] = get(val_metrics, k)
 
         log_metrics(logger, row)
         logger.info(f"epoch {epoch:03d} | {row} | {elapsed:.1f}s")
@@ -433,6 +498,51 @@ def fit(cfg: TrainConfig, label_to_idx: Dict[str,int]):
             logger.info(f"checkpoint improved on '{monitor_key}' -> saved (score={float(score):.6f})")
 
     logger.info("training done.")
+
+    # ---- full gpu memmory cleanup
+    try:
+        del model
+        del optimizer
+        del bce_tf
+        del bce_time
+    except Exception:
+        pass
+
+    try:
+        if train_loader is not None:
+            train_loader._iterator = None
+        if val_loader is not None:
+            val_loader._iterator = None
+        del train_loader
+        del val_loader
+    except Exception:
+        pass
+
+    import gc
+    gc.collect()
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        torch.cuda.reset_peak_memory_stats()
+
+    logger.info("GPU memory fully released.")
+
+    # close logger
+    handlers = list(logger.handlers)
+    for h in handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+        try:
+            h.close()
+        except Exception:
+            pass
+        logger.removeHandler(h)
+
     return paths
 
 
@@ -471,7 +581,7 @@ def load_train_config(json_path: str) -> Tuple[TrainConfig, Dict[str, int]]:
         amp               = J.get("amp", "bf16"),
         pos_weight        = J.get("pos_weight", "auto"),
         save_top_k        = J.get("save_top_k", 3),
-        monitor           = J.get("monitor", "val_f1"),
+        monitor           = J.get("monitor", "val_tf_f1_macro"),
         monitor_mode      = J.get("monitor_mode", "max"),
         seed              = J.get("seed", 42),
         logs_base         = J.get("logs_base", "logs_folder"),
@@ -495,6 +605,8 @@ def load_train_config(json_path: str) -> Tuple[TrainConfig, Dict[str, int]]:
         cfg.run_name = now_ts()
 
     return cfg, label_to_idx
+
+# parser for cli usage
 
 def parse_cli():
     p = argparse.ArgumentParser()
@@ -522,4 +634,6 @@ if __name__ == "__main__":
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-    fit(cfg, label_to_idx)
+    train_loader, val_loader = create_dataloaders(cfg, label_to_idx)
+
+    fit(cfg, label_to_idx, train_loader, val_loader)
