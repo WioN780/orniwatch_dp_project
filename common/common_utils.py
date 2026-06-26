@@ -18,6 +18,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from typing import Iterable, Dict, Optional, List, Tuple
 
+_N_FFT = 1024
+
  # mel <-> hz conversions
 def hz_to_mel(hz):
     return 2595.0 * np.log10(1.0 + hz / 700.0)
@@ -87,129 +89,6 @@ def annotations_in_window(annotations_df: pd.DataFrame, filename: str, win_s: fl
         m = (df["Start Time (s)"] < win_e) & (df["End Time (s)"] > win_s)
     return df.loc[m].copy()
 
-def plot_window_with_annotations(
-    ds,
-    annotations_df: pd.DataFrame,
-    idx: int,
-    title: str | None = None,
-    fully_contained: bool = False,
-):
-    """
-    Visualize ds[idx] mel + draw class boxes from annotations_df falling in the window.
-    Uses mel-bin centers (consistent with precompute).
-    """
-    fname, win_s, win_e = ds_window_info(ds, idx)
-
-    rows = annotations_in_window(annotations_df, fname, win_s, win_e, fully_contained=fully_contained)
-    cols = [c for c in ["Filename","Start Time (s)","End Time (s)","Low Freq (Hz)","High Freq (Hz)","Species eBird Code"] if c in rows.columns]
-    try:
-        # in notebooks this shows a nice table
-        display(rows[cols].sort_values(by=[c for c in ["Start Time (s)","End Time (s)"] if c in rows.columns]))
-    except Exception:
-        pass
-
-    mel, _ = ds[idx]                       # (1,F,T)
-    mel_np = mel.squeeze(0).detach().cpu().numpy()
-    Fm, T = mel_np.shape
-
-    # centers in Hz (F,)
-    centers = _mel_bin_centers_hz(Fm, ds.sr)  # (F,)
-    centers = centers.detach().cpu().numpy()
-
-    plt.figure(figsize=(12, 4))
-    plt.imshow(mel_np, origin="lower", aspect="auto")
-    ttl = title or f"{fname} | [{win_s:.2f}s, {win_e:.2f}s] (idx={idx})"
-    plt.title(ttl); plt.xlabel("Frames"); plt.ylabel("Mel bins")
-    ax = plt.gca()
-
-    sr, hop = ds.sr, ds.hop
-    for _, r in rows.iterrows():
-        # time → frames (clipped to window)
-        s = max(float(r["Start Time (s)"]), win_s)
-        e = min(float(r["End Time (s)"]),   win_e)
-        if e <= s: 
-            continue
-        sf = int(np.floor(((s - win_s) * sr) / hop))
-        ef = int(np.ceil(((e - win_s) * sr) / hop))
-        sf = max(0, min(T, sf)); ef = max(0, min(T, ef))
-        if ef <= sf:
-            continue
-
-        # freq → mel bins via centers
-        f_lo = float(r.get("Low Freq (Hz)", 0.0))
-        f_hi = float(r.get("High Freq (Hz)", sr/2))
-        fmask = (centers >= f_lo) & (centers <= f_hi)
-        if not np.any(fmask):
-            continue
-        ys = np.where(fmask)[0]
-        y0, y1 = int(ys.min()), int(ys.max())
-
-        rect = patches.Rectangle((sf, y0), ef - sf, y1 - y0 + 1, fill=False, linewidth=1)
-        ax.add_patch(rect)
-        lbl = str(r.get("Species eBird Code","cls"))
-        ax.text(sf + 1, y1, lbl, fontsize=7, va="top")
-
-    plt.xlim(0, T); plt.ylim(0, Fm)
-    plt.tight_layout(); plt.show()
-
-    return rows  # handy for downstream use
-
-# ---- random window finder --------------------------------------------------------
-def find_random_window_with_n_samples(
-    ds,
-    annotations_df: pd.DataFrame,
-    n: int,
-    mode: str = "at_least",        # "at_least" | "exact" | "at_most"
-    fully_contained: bool = False, # True => boxes must be entirely inside the window
-    seed: int | None = None,
-    max_tries: int = 2000,
-):
-    """
-    Randomly sample dataset indices until one has the desired count of annotations.
-    Returns: (idx, fname, win_s, win_e, rows) or (None, None, None, None, empty_df).
-    Requires helpers: ds_window_info(...) and annotations_in_window(...).
-    """
-    import random
-    rng = random.Random(seed)
-
-    def _ok(cnt: int) -> bool:
-        if mode == "exact":    return cnt == n
-        if mode == "at_least": return cnt >= n
-        if mode == "at_most":  return cnt <= n
-        raise ValueError("mode must be one of: 'at_least', 'exact', 'at_most'")
-
-    N = len(ds)
-    if N == 0:
-        return None, None, None, None, pd.DataFrame()
-
-    tried = set()
-    # random attempts
-    for _ in range(min(max_tries, N * 4)):
-        i = rng.randrange(N)
-        if i in tried: 
-            continue
-        tried.add(i)
-
-        fname, win_s, win_e = ds_window_info(ds, i)
-        rows = annotations_in_window(annotations_df, fname, win_s, win_e, fully_contained=fully_contained)
-        cnt  = int(rows.shape[0])
-        if _ok(cnt):
-            rows = rows.sort_values(by=[c for c in ["Start Time (s)","End Time (s)"] if c in rows.columns])
-            return i, fname, win_s, win_e, rows
-
-    # fallback: linear scan
-    for i in range(N):
-        if i in tried:
-            continue
-        fname, win_s, win_e = ds_window_info(ds, i)
-        rows = annotations_in_window(annotations_df, fname, win_s, win_e, fully_contained=fully_contained)
-        cnt  = int(rows.shape[0])
-        if _ok(cnt):
-            rows = rows.sort_values(by=[c for c in ["Start Time (s)","End Time (s)"] if c in rows.columns])
-            return i, fname, win_s, win_e, rows
-
-    return None, None, None, None, pd.DataFrame()
-
 # ---------- (A) MEL-only precompute ----------
 def _process_row_mel(row_id, row, recordings_dir, sr, hop_length, n_mels, max_frames, out_dir):
     filename = os.path.join(recordings_dir, row["Filename"])
@@ -230,7 +109,7 @@ def _process_row_mel(row_id, row, recordings_dir, sr, hop_length, n_mels, max_fr
     clip = waveform[:, start_sample:end_sample]
 
     mel_tf = torchaudio.transforms.MelSpectrogram(
-        sample_rate=sr, n_fft=1024, hop_length=hop_length, n_mels=n_mels
+        sample_rate=sr, n_fft=_N_FFT, hop_length=hop_length, n_mels=n_mels
     )
     db = torchaudio.transforms.AmplitudeToDB()
 
@@ -282,116 +161,195 @@ def precompute_mels(
     print(f"✅ Saved {len(df)} MELs to {output_dir}/")
 
 # ---------- (B) MEL + time–frequency target precompute ----------
-def _choose_window_around_box(s, e, window_len, rng, file_dur):
+def _choose_window_around_box(s, e, window_len, rng, file_dur, len_soft=True, sr=32000):
+    """
+    len_soft=True  -> fixed window_len windows
+    len_soft=False -> window_len is MAX; if box shorter, use box length (variable)
+    """
     L = max(0.0, e - s)
-    if L >= window_len:
-        # box longer than window -> center the window on the box midpoint
-        mid = 0.5 * (s + e)
-        win_s = mid - 0.5 * window_len
-    else:
-        slack = window_len - L
-        win_s = s - rng.uniform(0.0, slack)
-    # clamp to file bounds
-    win_s = max(0.0, min(win_s, max(0.0, file_dur - window_len)))
-    return win_s, win_s + window_len
 
-def _process_file_random_windows(
-    filename, rows, sr, hop, n_mels, max_frames, out_dir, label_to_idx, hz_centers,
-    window_len, seed
+    if len_soft:
+        win_len = window_len
+    else:
+        win_len = min(window_len, L)
+        min_len_s = _N_FFT / float(sr)
+        win_len = max(win_len, min_len_s)
+
+    if L >= win_len:
+        mid = 0.5 * (s + e)
+        win_s = mid - 0.5 * win_len
+    else:
+        slack = max(0.0, win_len - L)
+        win_s = s - rng.uniform(0.0, slack)
+
+    win_s = max(0.0, min(win_s, max(0.0, file_dur - win_len)))
+    return win_s, win_s + win_len
+
+
+def _overlap_frames_fast(s, e, win_s, sr, hop, T):
+    """
+    Map absolute [s,e] to window-relative frame indices [sf,ef) in [0,T].
+    """
+    sf = int(math.floor((s - win_s) * sr / hop))
+    ef = int(math.ceil((e - win_s) * sr / hop))
+    if ef <= 0 or sf >= T:
+        return None
+    sf = max(0, min(sf, T))
+    ef = max(0, min(ef, T))
+    if ef <= sf:
+        return None
+    return sf, ef
+
+
+def _process_file_random_windows_fast(
+    filename, rows, sr, hop, n_mels, max_frames, out_dir,
+    label_to_idx, hz_centers,
+    window_len, seed,
+    len_soft=True,
 ):
-    # load and (if needed) resample once per file
+    # avoid CPU oversubscription inside multiprocessing
+    try:
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+
+    # load and resample once per file
     try:
         wav, file_sr = torchaudio.load(filename)
     except Exception as e:
         return [], [f"⚠️ Skipped {filename}: {e}"]
 
+    # force mono for consistent mel shape (1, n_mels, T)
+    if wav.dim() == 2 and wav.size(0) > 1:
+        wav = wav.mean(dim=0, keepdim=True)
+
     if file_sr != sr:
         wav = torchaudio.transforms.Resample(file_sr, sr)(wav)
+
     file_dur = wav.size(-1) / sr
 
     mel_tf = torchaudio.transforms.MelSpectrogram(
-        sample_rate=sr, n_fft=1024, hop_length=hop, n_mels=n_mels, center=False
+        sample_rate=sr, n_fft=_N_FFT, hop_length=hop, n_mels=n_mels, center=False
     )
     db_tf = torchaudio.transforms.AmplitudeToDB()
 
-    used = np.zeros(len(rows), dtype=bool)
-    rng = random.Random((seed ^ hash(os.path.basename(filename))) & 0xFFFFFFFF) # fancy roll
+    # >>> BIG SPEEDUP: compute mel for the whole file ONCE
+    mel_full = db_tf(mel_tf(wav))           # (1, n_mels, T_full)
+    T_full = int(mel_full.shape[-1])
+
+    # rows -> numpy arrays once
+    N = len(rows)
+    starts = np.fromiter((float(r["Start Time (s)"]) for r in rows), dtype=np.float64, count=N)
+    ends   = np.fromiter((float(r["End Time (s)"])   for r in rows), dtype=np.float64, count=N)
+    lowhz  = np.fromiter((float(r["Low Freq (Hz)"])  for r in rows), dtype=np.float64, count=N)
+    highhz = np.fromiter((float(r["High Freq (Hz)"]) for r in rows), dtype=np.float64, count=N)
+    spcode = np.array([r["Species eBird Code"] for r in rows], dtype=object)
+    row_id = np.fromiter((int(r["row_id"]) for r in rows), dtype=np.int64, count=N)
+
+    # precompute mel-bin spans per row (faster than boolean masks)
+    centers = np.asarray(hz_centers)
+    lo_bin = np.searchsorted(centers, lowhz, side="left")
+    hi_bin = np.searchsorted(centers, highhz, side="right")
+
+    used = np.zeros(N, dtype=bool)
+    rng = random.Random((seed ^ hash(os.path.basename(filename))) & 0xFFFFFFFF)
 
     manifest_rows, logs = [], []
     base = os.path.splitext(os.path.basename(filename))[0]
     sample_idx = 0
 
-    # iterate until all rows consumed by some window
-    for i in range(len(rows)):
+    for i in range(N):
         if used[i]:
             continue
-        r0 = rows[i]
-        s0, e0 = float(r0["Start Time (s)"]), float(r0["End Time (s)"])
 
-        win_s, win_e = _choose_window_around_box(s0, e0, window_len, rng, file_dur)
+        s0, e0 = float(starts[i]), float(ends[i])
+        win_s, win_e = _choose_window_around_box(
+            s0, e0, window_len, rng, file_dur, len_soft=len_soft, sr=sr
+        )
 
-        # collect all boxes overlapped by this window and mark them used
-        boxes = []
-        src_ids = []
-        for j, r in enumerate(rows):
-            if used[j]:
-                continue
-            s2, e2 = float(r["Start Time (s)"]), float(r["End Time (s)"])
-            if (s2 >= win_s) and (e2 <= win_e):
-                boxes.append((
-                    s2, e2,
-                    float(r["Low Freq (Hz)"]), float(r["High Freq (Hz)"]),
-                    r["Species eBird Code"]
-                ))
-                used[j] = True
-                src_ids.append(int(r["row_id"]))
-
-        # slice audio (pad if window exceeds tail by a hair)
-        start_sample = int(math.floor(win_s * sr))
-        need = int(round(window_len * sr))
-        end_sample = start_sample + need
-        if end_sample > wav.size(-1):
-            pad = end_sample - wav.size(-1)
-            clip = F.pad(wav, (0, pad))
+        # Map window to frame indices into mel_full
+        if len_soft:
+            # fixed frame length windows: force exactly max_frames
+            frame_s = int(math.floor(win_s * sr / hop))
+            # clamp so we can take max_frames if possible
+            frame_s = max(0, min(frame_s, max(0, T_full - max_frames)))
+            frame_e = frame_s + max_frames
         else:
-            clip = wav[:, start_sample:end_sample]
+            frame_s = int(math.floor(win_s * sr / hop))
+            frame_e = int(math.ceil(win_e * sr / hop))
+            frame_s = max(0, min(frame_s, max(0, T_full - 1)))
+            frame_e = max(frame_s + 1, min(frame_e, T_full))
 
-        # mel -> dB
-        mel = db_tf(mel_tf(clip))  # (1, n_mels, Tvar)
+        win_s = frame_s * hop / sr
+        win_e = frame_e * hop / sr
+        win_len_eff = win_e - win_s
 
-        # fix T
-        T = mel.shape[-1]
-        if T < max_frames:
-            mel = F.pad(mel, (0, max_frames - T))
-            T = max_frames
-        elif T > max_frames:
-            mel = mel[..., :max_frames]
-            T = max_frames
+        # >>> BIG SPEEDUP: vectorized "rows fully inside this window"
+        in_window = (~used) & (starts >= win_s) & (ends <= win_e)
+        idxs = np.where(in_window)[0]
+        if idxs.size == 0:
+            # fallback: at least include anchor row
+            idxs = np.array([i], dtype=np.int64)
 
-        # target
+        used[idxs] = True
+        src_ids = row_id[idxs].tolist()
+
+        # mel slice
+        mel = mel_full[..., frame_s:frame_e]        # (1, n_mels, T)
+        T = int(mel.shape[-1])
+
+        if len_soft:
+            # pad if file is shorter than window at the end
+            if T < max_frames:
+                mel = F.pad(mel, (0, max_frames - T))
+                T = max_frames
+            elif T > max_frames:
+                mel = mel[..., :max_frames]
+                T = max_frames
+        else:
+            # variable; only truncate if something oversized
+            if T > max_frames:
+                mel = mel[..., :max_frames]
+                T = max_frames
+
+        # target tensor
         C = len(label_to_idx)
         target = torch.zeros((C, n_mels, T), dtype=torch.uint8)
-        centers = hz_centers
-        for s, e, f_lo, f_hi, sp in boxes:
+
+        # fill targets (only boxes inside window)
+        for idx in idxs:
+            sp = spcode[idx]
             c = label_to_idx.get(sp, None)
             if c is None:
                 continue
-            span = _overlap_frames(s, e, win_s, win_e, sr, hop, T)
+
+            span = _overlap_frames_fast(float(starts[idx]), float(ends[idx]), win_s, sr, hop, T)
             if span is None:
                 continue
             sf, ef = span
-            fmask = (centers >= f_lo) & (centers <= f_hi)
-            if fmask.any():
-                target[c, fmask, sf:ef] = 1
 
-        # save sample
+            fb0 = int(lo_bin[idx])
+            fb1 = int(hi_bin[idx])
+            if fb1 <= fb0:
+                continue
+            fb0 = max(0, min(fb0, n_mels))
+            fb1 = max(0, min(fb1, n_mels))
+            if fb1 <= fb0:
+                continue
+
+            target[c, fb0:fb1, sf:ef] = 1
+
         out_blob = {
             "mel": mel.to(torch.float16).contiguous(),
             "target": target,
             "file": filename,
             "win_s": float(win_s),
             "win_e": float(win_e),
+            "win_len": float(win_len_eff),
+            "n_frames": int(T),
             "row_ids": src_ids,
+            "len_soft": bool(len_soft),
         }
         out_name = f"{base}__{sample_idx:04d}.pt"
         torch.save(out_blob, os.path.join(out_dir, out_name))
@@ -401,11 +359,14 @@ def _process_file_random_windows(
             "audio_filename": filename,
             "win_s": win_s,
             "win_e": win_e,
+            "win_len": win_len_eff,
+            "n_frames": int(T),
             "row_ids_json": json.dumps(src_ids),
         })
         sample_idx += 1
 
     return manifest_rows, logs
+
 
 def precompute_sed_samples(
     annotations_file,
@@ -420,16 +381,13 @@ def precompute_sed_samples(
     label_to_idx=None,
     seed=1234,
     num_workers=None,
+    len_soft=True,
 ):
-    """
-    Build fixed-length windows at random offsets that *contain* one unused box each,
-    mark all overlapped boxes as used, and save (mel, target) + a manifest CSV.
-    """
     os.makedirs(output_dir, exist_ok=True)
     samples_dir = os.path.join(output_dir, "samples")
     os.makedirs(samples_dir, exist_ok=True)
 
-    if ".csv" not in annotations_file :
+    if ".csv" not in annotations_file:
         annotations_file = annotations_file + ".csv"
 
     df = pd.read_csv(annotations_file).reset_index().rename(columns={"index": "row_id"})
@@ -437,14 +395,16 @@ def precompute_sed_samples(
         species = sorted(df["Species eBird Code"].unique())
         label_to_idx = {s: i for i, s in enumerate(species)}
 
+    # frames for MAX window_len
     max_frames = int(round(window_len * sr / hop_length))
-    hz_centers = _mel_bin_centers_hz(n_mels, sr, fmin, fmax)  # centers in Hz  
 
-    # group rows by file
+    # keep your existing helper
+    hz_centers = _mel_bin_centers_hz(n_mels, sr, fmin, fmax)
+
     groups = []
     for fname, g in df.groupby("Filename"):
-        filename = os.path.join(recordings_dir, fname)
-        groups.append((filename, list(g.to_dict("records"))))
+        fullpath = os.path.join(recordings_dir, fname)
+        groups.append((fullpath, list(g.to_dict("records"))))
 
     if num_workers is None:
         import multiprocessing
@@ -453,18 +413,18 @@ def precompute_sed_samples(
     all_manifest, all_logs = [], []
     with ProcessPoolExecutor(max_workers=num_workers) as ex:
         futures = []
-        for filename, rows in groups:
+        for fullpath, rows in groups:
             futures.append(ex.submit(
-                _process_file_random_windows,
-                filename, rows, sr, hop_length, n_mels, max_frames, samples_dir,
-                label_to_idx, hz_centers, window_len, seed
+                _process_file_random_windows_fast,
+                fullpath, rows, sr, hop_length, n_mels, max_frames, samples_dir,
+                label_to_idx, hz_centers, window_len, seed,
+                len_soft,
             ))
         for f in tqdm(as_completed(futures), total=len(futures), desc="Random-window SED"):
             manifest_rows, logs = f.result()
             all_manifest.extend(manifest_rows)
             all_logs.extend(logs)
 
-    # write manifest
     manifest_path = os.path.join(output_dir, "manifest.csv")
     pd.DataFrame(all_manifest).to_csv(manifest_path, index=False)
 
@@ -472,6 +432,7 @@ def precompute_sed_samples(
     print(f"🧾 Manifest: {manifest_path}")
     for m in all_logs:
         print(m)
+
 
 # --------- benchmark_pipeline
 def benchmark_pipeline(model, loader, device=None, batches=50, use_amp=True):
@@ -541,7 +502,7 @@ def benchmark_pipeline(model, loader, device=None, batches=50, use_amp=True):
     return res
 
 # ---------- pos_weight helper ----------
-def compute_pos_weight(loader, device, limit_batches=None, power=0.5, cap=(0.5, 8.0), normalize=True):
+def compute_pos_weight(loader, device, limit_batches=None, power=0.5, cap=(0.5, 8.0), normalize=True, global_scale=50.0):
     """
     time-reduced pos_weight:
       raw = neg/pos  (from y.amax(dim=2) if TF)
@@ -583,5 +544,8 @@ def compute_pos_weight(loader, device, limit_batches=None, power=0.5, cap=(0.5, 
     w = raw.pow(power)
     if normalize:
         w = w / w.mean().clamp_min(1e-8)
+
+    w = w * global_scale
+
     w = w.clamp(cap[0], cap[1]).contiguous()
     return w, raw
