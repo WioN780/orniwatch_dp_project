@@ -122,6 +122,7 @@ class TrainConfig:
     include_overlaps: bool = True
     lr: float = 1e-3
     epochs: int = 10
+    global_scale: int = 60.0
 
     model_name: str = "BirdCRNN"
     model: Type = field(default=BirdModels.BirdCRNN)
@@ -354,7 +355,8 @@ def fit(cfg: TrainConfig,
     train_loader: Optional[DataLoader] = None, 
     val_loader: Optional[DataLoader] = None,
     mem_save: bool = True,
-    max_iter_mem_save: int = 5
+    max_iter_mem_save: int = 5,
+    pos_weight=None
 ):
     """
     Main training loop
@@ -389,10 +391,11 @@ def fit(cfg: TrainConfig,
     logger.info(f"train samples: {len(train_loader.dataset)}, val samples: {len(val_loader.dataset)}")
 
     # pos_weight
-    pos_weight = None
-    if cfg.pos_weight == "auto" and compute_pos_weight is not None:
-        pos_weight, _ = compute_pos_weight(train_loader, device, limit_batches=None)
-        logger.info(f"pos_weight(auto): {pos_weight}")
+    if pos_weight is None: 
+        pos_weight = None
+        if cfg.pos_weight == "auto" and compute_pos_weight is not None:
+            pos_weight, _ = compute_pos_weight(train_loader, device, limit_batches=None, power=0.1, cap=(1.0, 150.0), normalize=True, global_scale=cfg.global_scale)
+            logger.info(f"pos_weight(auto): {pos_weight}")
 
     # losses
     if pos_weight is not None:
@@ -576,6 +579,7 @@ def load_train_config(json_path: str) -> Tuple[TrainConfig, Dict[str, int]]:
         include_overlaps  = J.get("include_overlaps", True),
         lr                = J.get("lr", 1e-3),
         epochs            = J.get("epochs", 10),
+        global_scale      = J.get("global_scale", 60.0),
         model_name        = J.get("model_name", "BirdCRNN"),
         model             = BirdModels.BirdCRNN,   # temp
         amp               = J.get("amp", "bf16"),

@@ -92,7 +92,7 @@ def accuracy_from_logits(logits: torch.Tensor, target: torch.Tensor, thr: float 
 def prf1_macro_from_logits(logits, target, thr: float = 0.5):
     """
     Macro P/R/F1 averaged ONLY over classes with at least one positive (support > 0).
-    Absent classes get NaN in the per-class vector (so you can inspect sparsity).
+    Absent classes get NaN in the per-class vector
     Works for (B,C,T) or (B,C,F,T).
     """
     p_bin = (logits.sigmoid() > thr).to(target.dtype)
@@ -124,8 +124,8 @@ def prf1_macro_from_logits(logits, target, thr: float = 0.5):
 
 def balanced_accuracy_from_logits(logits, target, thr: float = 0.5):
     """
-    Macro balanced accuracy over classes that have BOTH positives and negatives.
-    Masks degenerate classes (all 0s or all 1s).
+    Macro balanced accuracy over classes that have BOTH positives and negatives
+    Masks degenerate classes (all 0s or all 1s)
     """
     p_bin = (logits.sigmoid() > thr).to(target.dtype)
     C = target.shape[1]
@@ -209,7 +209,7 @@ def compute_time_metrics(time_logits: torch.Tensor, y_time: torch.Tensor, thr: f
 
 
 def prevalence_per_class(target: torch.Tensor) -> torch.Tensor:
-    """Fraction of positives per class in a batch/array (returns (C,))."""
+    """Fraction of positives per class in a batch/array (returns (C,))"""
     C = target.shape[1]
     t_flat = target.reshape(target.shape[0], C, -1).transpose(0, 1).reshape(C, -1)
     return t_flat.mean(dim=1)

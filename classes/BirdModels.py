@@ -73,7 +73,7 @@ class BirdCRNN(nn.Module):
         rnn_in = rnn_in.view(B, Tp, Cc * Fp)                # (B,T, Cc*F')
 
         if lengths is not None:
-            # lengths are in frames of original T; CNN kept T, so still valid
+            # lengths are in frames of original T, CNN kept T
             packed = nn.utils.rnn.pack_padded_sequence(rnn_in, lengths.cpu(), batch_first=True, enforce_sorted=False)
             packed_out, _ = self.gru(packed)
             rnn_out, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)  # (B,T,2H)
@@ -89,9 +89,7 @@ class BirdCRNN(nn.Module):
 
         # --- tf head ---
         tf_low = self.head_tf(feat_map)                     # (B,C,F',T)
-        # upsample along frequency back to F; keep time as-is
+        # upsample along frequency back to F, keep time as-is
         tf_logits = F.interpolate(tf_low, size=(Fm, T), mode="bilinear", align_corners=False)  # (B,C,F,T)
 
         return time_logits, tf_logits
-
-

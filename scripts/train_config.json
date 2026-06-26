@@ -18,9 +18,9 @@
   "amp": "fp16",
   "pos_weight": "auto",
   "save_top_k": 3,
-  "monitor": "val_f1",
-  "monitor_mode": "max",
+  "monitor": "val_loss",
+  "monitor_mode": "min",
   "seed": 42,
   "logs_base": "logs/",
-  "run_name": "my_run_name_optional"
+  "run_name": "run_1"
 }
