@@ -1,7 +1,5 @@
 # OrniWatch — Passive Bird Species Detection via CRNN
 
-**Author:** Mark Slipenkyi &nbsp;|&nbsp; **Year:** 2025 &nbsp;|&nbsp; **Repo:** [WioN780/orniwatch_dp_project](https://github.com/WioN780/orniwatch_dp_project)
-
 A deep-learning system for passive acoustic monitoring of bird species. OrniWatch uses a **Convolutional Recurrent Neural Network (CRNN)** to detect bird vocalisations in long-form audio recordings, outputting per-frame predictions over time for each of 10 target species.
 
 ## Table of Contents
@@ -124,58 +122,3 @@ Sigmoid  ─── multilabel output (one score per class, per timestep)
 - torchaudio
 - librosa
 - numpy, pandas, matplotlib
-
-### 1. Clone the repository
-
-```bash
-git clone https://github.com/WioN780/orniwatch_dp_project.git
-cd orniwatch_dp_project
-```
-
-### 2. Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### 3. Prepare data
-
-Ensure your audio recordings and annotation files are placed according to the expected directory structure. **Training and validation recordings must reside in separate files** — do not split a single file between splits.
-
-```
-data/
-├── train/          # training recordings
-├── val/            # validation recordings (separate source files)
-└── annotations/    # annotation files (e.g. CSV or JSON per recording)
-```
-
-Run the preprocessing script to segment recordings and pre-compute mel spectrogram tensors:
-
-```bash
-python preprocess.py \
-  --hop_length 512 \
-  --n_mels 128 \
-  --window_len 50
-```
-
-> **Note:** Adjust `hop_length`, `n_mels`, and `window_len` to match your hardware constraints and annotation resolution. The values above reflect the configuration used in the reported results.
-
-### 4. Train
-
-```bash
-python train.py
-```
-
-Training uses `BCEWithLogitsLoss` with per-class positive weights to compensate for label sparsity. Monitor validation loss — the model can overfit quickly on short windows.
-
-### 5. Run inference / demo
-
-```bash
-python demo.py --audio path/to/recording.wav
-```
-
-The demo outputs a time-series plot of per-species detection probabilities across the recording.
-
----
-
-*For questions or contributions, open an issue on GitHub.*
