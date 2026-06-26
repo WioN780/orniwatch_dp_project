@@ -55,17 +55,19 @@ Small input windows caused the model to overfit rapidly — validation loss woul
 
 ### Demonstration Results
 
-**One class was particularly well detected**, though a degree of background noise remains present in the predictions.
+**One class was particularly well detected**, (Thrush-like Wren) though a degree of background noise remains present in the predictions.
 
-![Grosbeak](.github/assets/demo-class.jpg)
+![Thrush](.github/assets/thrush.png)
 
 Two additional examples are worth noting from the manually gathered dataset:
 
 - **Amazonian Grosbeak** — detections are reasonably clean and correlate well with actual vocalisations.
 - **Gray-fronted Dove** *(South America)* — shows detectable activations despite **not being included in the 10 training classes**. This suggests the model has learned generalizable acoustic features that transfer to unseen species.
 
-![Grosbeak](.github/assets/grosbeak.jpg)
-![Dove](.github/assets/dove.jpg)
+![Grosbeak](.github/assets/grosbeak.png)
+![Dove](.github/assets/dove.png)
+
+
 
 ---
 
